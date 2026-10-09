@@ -37,14 +37,16 @@ In a dedicated folder, prepare a `cluster-kind.yaml` configuration file like thi
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
-- role: control-plane
-  extraPortMappings:
-  - containerPort: 80
-    hostPort: 80
-    protocol: TCP
-  - containerPort: 443
-    hostPort: 443
-    protocol: TCP
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 80
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 443
+        listenAddress: "127.0.0.1"
+        protocol: TCP
 EOF
 ```
 
@@ -93,6 +95,36 @@ Install Envoy Gateway using its Helm chart:
   helm install envoy-gateway oci://docker.io/envoyproxy/gateway-helm -n envoy-gateway-system --create-namespace
 ```
 
+```sh
+NAME: envoy-gateway
+LAST DEPLOYED: Fri Oct  9 15:02:08 2026
+NAMESPACE: envoy-gateway-system
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+NOTES:
+**************************************************************************
+*** PLEASE BE PATIENT: Envoy Gateway may take a few minutes to install ***
+**************************************************************************
+
+Envoy Gateway is an open source project for managing Envoy Proxy as a standalone or Kubernetes-based application gateway.
+
+Thank you for installing Envoy Gateway! 🎉
+
+Your release is named: envoy-gateway. 🎉
+
+Your release is in namespace: envoy-gateway-system. 🎉
+
+To learn more about the release, try:
+
+  $ helm status envoy-gateway -n envoy-gateway-system
+  $ helm get all envoy-gateway -n envoy-gateway-system
+
+To have a quickstart of Envoy Gateway, please refer to https://gateway.envoyproxy.io/latest/tasks/quickstart.
+
+To get more details, please visit https://gateway.envoyproxy.io and https://github.com/envoyproxy/gateway.
+```
+
 Wait for the deployment to become ready:
 
 ```sh
@@ -102,6 +134,8 @@ Wait for the deployment to become ready:
   deployment/envoy-gateway \
   --timeout=120s
 ```
+
+This installation also installs the Gateway API CRDs.
 
 Create a GatewayClass:
 
@@ -116,26 +150,168 @@ spec:
 EOF
 ```
 
+```sh
+gatewayclass.gateway.networking.k8s.io/envoy created
+```
+
 Verify that the GatewayClass has been accepted:
 
 ```sh
   kubectl get gatewayclass envoy
 ```
 
-## 4. Install Microcks with default options
+```sh
+NAME    CONTROLLER                                      ACCEPTED   AGE
+envoy   gateway.envoyproxy.io/gatewayclass-controller   True       22s
+```
 
-We're now going to install Microcks with basic options. We'll do that using the Helm Chart, so you'll also need the [`helm`](https://helm.sh) binary. You can use `brew install helm` on Mac for that.
+Create the Microcks namespace:
 
 ```sh
   kubectl create namespace microcks
-  helm repo add microcks https://microcks.io/helm
-  helm install microcks microcks/microcks --namespace microcks --set microcks.url=microcks.127.0.0.1.nip.io --set keycloak.url=keycloak.127.0.0.1.nip.io --set keycloak.privateUrl=http://microcks-keycloak.microcks.svc.cluster.local:8080
+```
+
+Configure an Envoy for the Kind cluster:
+
+```sh
+  cat <<EOF | kubectl apply -f -
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: microcks-proxy
+  namespace: microcks
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - port: 443
+                  nodePort: 30443
+EOF
+```
+
+Create two HTTPS listeners on port 443, one for Microcks and one for Keycloak. Both listeners use the same certificate, which covers both hostnames.
+
+```sh
+  cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: microcks-gateway
+  namespace: microcks
+spec:
+  gatewayClassName: envoy
+
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: microcks-proxy
+
+  listeners:
+    - name: microcks-https
+      hostname: microcks.127.0.0.1.nip.io
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: microcks-local-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+
+    - name: keycloak-https
+      hostname: keycloak.127.0.0.1.nip.io
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: microcks-local-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+EOF
+```
+
+## 4. Create a local TLS certificate
+
+Generates TLS certificates for Gateway API listeners:
+
+```sh
+  openssl req -x509 -nodes -days 365 \
+  -newkey rsa:2048 \
+  -keyout microcks-local.key \
+  -out microcks-local.crt \
+  -subj "/CN=microcks.127.0.0.1.nip.io" \
+  -addext "subjectAltName=DNS:microcks.127.0.0.1.nip.io,DNS:keycloak.127.0.0.1.nip.io"
+```
+
+```sh
+  kubectl create secret tls microcks-local-tls \
+  --namespace microcks \
+  --key=microcks-local.key \
+  --cert=microcks-local.crt
+```
+
+Check that the secret is created:
+
+```sh
+  kubectl get secret microcks-local-tls -n microcks
+```
+
+```sh
+
+NAME                 TYPE                DATA   AGE
+microcks-local-tls   kubernetes.io/tls   2      20s
+```
+
+Note that the certificate is self-signed, so the browser will display a security warning until you trust it.
+
+## 5. Install Microcks 
+
+We're now going to install Microcks with basic options. We'll do that using the Helm Chart, so you'll also need the [`helm`](https://helm.sh) binary. You can use `brew install helm` on Mac for that.
+
+Add the Microcks Helm repository:
+
+```sh
+  helm repo add microcks https://microcks.io/helm/
+  helm repo update
+```
+
+Install Microcks with Gateway API routes enabled and Ingress resources disabled:
+
+```sh
+  helm install microcks microcks/microcks \
+  --namespace microcks \
+  --create-namespace \
+  --set ingresses=false \
+  --set gatewayRoutes=true \
+  --set gatewayRefName=microcks-gateway \
+  --set gatewayRefSectionName=microcks-https \
+  --set microcks.url=microcks.127.0.0.1.nip.io \
+  --set microcks.gatewayRefSectionName=microcks-https \
+  --set microcks.generateCert=false \
+  --set keycloak.url=keycloak.127.0.0.1.nip.io \
+  --set keycloak.privateUrl=http://microcks-keycloak.microcks.svc.cluster.local:8080 \
+  --set keycloak.gatewayRefName=microcks-gateway \
+  --set keycloak.gatewayRefSectionName=keycloak-https \
+  --set keycloak.generateCert=false
 ```
 
 ```sh
 
 NAME: microcks
-LAST DEPLOYED: Sun Dec  3 19:27:27 2023
+LAST DEPLOYED: Fri Oct  9 22:41:23 2026
 NAMESPACE: microcks
 STATUS: deployed
 REVISION: 1
@@ -147,50 +323,57 @@ Your release is named microcks.
 
 To learn more about the release, try:
 
-    helm status microcks
-    helm get microcks
+  $ helm status microcks
+  $ helm get microcks
 
 Microcks is available at https://microcks.127.0.0.1.nip.io.
 
 GRPC mock service is available at "microcks-grpc.127.0.0.1.nip.io".
 It has been exposed using TLS passthrough on the Ingress controller, you should extract the certificate for your client using:
 
-    kubectl get secret microcks-microcks-grpc-secret -n microcks -o jsonpath='{.data.tls\.crt}' | base64 -d > tls.crt
+  $ kubectl get secret microcks-microcks-grpc-secret -n microcks -o jsonpath='{.data.tls\.crt}' | base64 -d > tls.crt
+
 Keycloak has been deployed on https://keycloak.127.0.0.1.nip.io to protect user access.
 You may want to configure an Identity Provider or add some users for your Microcks installation by login in using the
 username and password found into 'microcks-keycloak-admin' secret.
 ```
 
-Wait for images to be pulled, pods to be started and ingresses to be there:
+Wait for the pods to become ready:
 
 ```sh
   kubectl get pods -n microcks
 ```
+
 ```sh
 
 NAME                                            READY   STATUS    RESTARTS   AGE
-microcks-577874c5b6-z97zm                       1/1     Running   0          73s
-microcks-keycloak-7477cd4fbb-tbmg7              1/1     Running   0          21s
-microcks-keycloak-postgresql-868b7dbdd4-8zrbv   1/1     Running   0          10m
-microcks-mongodb-78888fb67f-47fwh               1/1     Running   0          10m
-microcks-postman-runtime-5d8fc9695-kp45w        1/1     Running   0          10m
-```
-```sh
-  kubectl get ingresses -n microcks
-```
-```sh
-
-NAME                CLASS    HOSTS                            ADDRESS     PORTS     AGE
-microcks            <none>   microcks.127.0.0.1.nip.io        localhost   80, 443   10m
-microcks-grpc       <none>   microcks-grpc.127.0.0.1.nip.io   localhost   80, 443   10m
-microcks-keycloak   <none>   keycloak.127.0.0.1.nip.io        localhost   80, 443   10m
+microcks-68657ccb64-l9zkx                       1/1     Running   0          118s
+microcks-keycloak-7c995cbf6d-xtb69              1/1     Running   0          118s
+microcks-keycloak-postgresql-6dbb9744df-56plm   1/1     Running   0          118s
+microcks-mongodb-66c77b5dbd-wjf5f               1/1     Running   0          118s
+microcks-postman-runtime-566748c78-f7mzk        1/1     Running   0          118s
 ```
 
-Start opening `https://keycloak.127.0.0.1.nip.io` in your browser to validate the self-signed certificate. Once done, you can visit `https://microcks.127.0.0.1.nip.io` in your browser, validate the self-signed certificate and start playing around with Microcks!
+Inspect the generated routes:
+
+```sh
+  kubectl get httproute -n microcks
+```
+
+```sh
+
+NAME                HOSTNAMES                       AGE
+microcks            ["microcks.127.0.0.1.nip.io"]   2m16s
+microcks-keycloak   ["keycloak.127.0.0.1.nip.io"]   2m16s
+```
+
+Start opening `https://keycloak.127.0.0.1.nip.io/` in your browser to validate the self-signed certificate. Once done, you can visit `https://microcks.127.0.0.1.nip.io/` in your browser, validate the self-signed certificate and start playing around with Microcks!
 
 The default user/password is `admin/microcks123`
 
-## 5. Install Microcks with asynchronous options
+## 6. Install Microcks with asynchronous options
+
+TODO!!!
 
 In this section, we're installing Microcks completely and enabling the asynchronous protocols feature. This requires deploying additional pods and a Kafka cluster. Microcks installs and manages its own cluster using the [Strimzi](https://strimzi.io) project.
 
