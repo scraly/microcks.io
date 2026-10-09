@@ -25,7 +25,7 @@ As being on a Mac, people usually use [brew](https://brew.sh) to install `kind`.
 ```
 
 ```sh
-kind version 0.20.0
+kind version 0.33.0
 ```
 
 In a dedicated folder, prepare a `cluster-kind.yaml` configuration file like this:
@@ -38,12 +38,6 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
-  kubeadmConfigPatches:
-  - |
-    kind: InitConfiguration
-    nodeRegistration:
-      kubeletExtraArgs:
-        node-labels: "ingress-ready=true"
   extraPortMappings:
   - containerPort: 80
     hostPort: 80
@@ -61,10 +55,10 @@ We're now going to start a Kube cluster. Start your `kind` cluster using the `cl
 ```sh
   kind create cluster --config=cluster-kind.yaml
 ```
-```sh
 
+```sh
 Creating cluster "kind" ...
- ✓ Ensuring node image (kindest/node:v1.27.3) 🖼 
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️ 
  ✓ Preparing nodes 📦  
  ✓ Writing configuration 📜 
  ✓ Starting control-plane 🕹️ 
@@ -78,22 +72,57 @@ kubectl cluster-info --context kind-kind
 Have a question, bug, or feature request? Let us know! https://kind.sigs.k8s.io/#community 🙂
 ``` 
 
-To install an Ingress Controller in this cluster, we selected `nginx`, but other options are available (see https://kind.sigs.k8s.io/docs/user/ingress ).
+Check that the node is available:
 
 ```sh
-  kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+  kubectl get nodes
 ```
-
-Wait for the controller to be available:
 
 ```sh
-  kubectl wait --namespace ingress-nginx \
-  --for=condition=ready pod \
-  --selector=app.kubernetes.io/component=controller \
-  --timeout=90s
+NAME                 STATUS   ROLES           AGE   VERSION
+kind-control-plane   Ready    control-plane   75s   v1.37.0
 ```
 
-## 3. Install Microcks with default options
+## 3. Install Envoy Gateway
+
+Envoy Gateway implements Kubernetes Gateway API and provides the proxy that will route traffic to Microcks.
+
+Install Envoy Gateway using its Helm chart:
+
+```sh
+  helm install envoy-gateway oci://docker.io/envoyproxy/gateway-helm -n envoy-gateway-system --create-namespace
+```
+
+Wait for the deployment to become ready:
+
+```sh
+  kubectl wait \
+  --namespace envoy-gateway-system \
+  --for=condition=Available \
+  deployment/envoy-gateway \
+  --timeout=120s
+```
+
+Create a GatewayClass:
+
+```sh
+  cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+EOF
+```
+
+Verify that the GatewayClass has been accepted:
+
+```sh
+  kubectl get gatewayclass envoy
+```
+
+## 4. Install Microcks with default options
 
 We're now going to install Microcks with basic options. We'll do that using the Helm Chart, so you'll also need the [`helm`](https://helm.sh) binary. You can use `brew install helm` on Mac for that.
 
@@ -161,7 +190,7 @@ Start opening `https://keycloak.127.0.0.1.nip.io` in your browser to validate th
 
 The default user/password is `admin/microcks123`
 
-## 4. Install Microcks with asynchronous options
+## 5. Install Microcks with asynchronous options
 
 In this section, we're installing Microcks completely and enabling the asynchronous protocols feature. This requires deploying additional pods and a Kafka cluster. Microcks installs and manages its own cluster using the [Strimzi](https://strimzi.io) project.
 
@@ -283,9 +312,9 @@ And finally, from your Mac host, you can install the [`kcat`](https://github.com
 ^C%  
 ```
 
-## 5. Delete everything and stop the cluster
+## 6. Delete everything and stop the cluster
 
-Deleting the microcks Helm release from your cluster is straightforward. Then you can finally delete your Kind cluster to save some resources!
+Deleting the microcks Helm release from your cluster is straightforward. Then you can finally delete the envoy gateway and your Kind cluster to save some resources!
 
 ```sh
   helm delete microcks -n microcks
@@ -295,6 +324,17 @@ Deleting the microcks Helm release from your cluster is straightforward. Then yo
 
 Release "microcks" uninstalled
 ```
+
+```sh
+  helm delete envoy-gateway -n envoy-gateway-system
+```
+
+```sh
+
+Release "envoy-gateway" uninstalled
+```
+
+
 ```sh
   kind delete cluster
 ```
