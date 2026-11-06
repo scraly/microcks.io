@@ -17,10 +17,10 @@ Let's go 🚀
 
 ## 1. Preparation
 
-As being on a Mac, people usually use [brew](https://brew.sh) to install `kind`. However, it is also available from several different package managers out there. You can check the [Quick Start](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) guide for that. Obviously, you'll also need the [`kubectl`](https://kubernetes.io/docs/tasks/tools/#kubectl) utility to interact with your cluster. 
+On a Mac, people usually use [brew](https://brew.sh) to install `kind`. However, it is also available from several different package managers out there. You can check the [Quick Start](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) guide for that. Obviously, you'll also need the [`kubectl`](https://kubernetes.io/docs/tasks/tools/#kubectl) utility to interact with your cluster, and the [`helm`](https://helm.sh) binary to install Envoy Gateway and Microcks.
 
 ```sh
-  brew install kind
+  brew install kind helm
   kind --version
 ```
 
@@ -165,13 +165,49 @@ NAME    CONTROLLER                                      ACCEPTED   AGE
 envoy   gateway.envoyproxy.io/gatewayclass-controller   True       22s
 ```
 
+## 4. Create a local TLS certificate and the Gateway
+
 Create the Microcks namespace:
 
 ```sh
   kubectl create namespace microcks
 ```
 
-Configure an Envoy for the Kind cluster:
+Generate a TLS certificate for the Gateway API listeners. It covers the Microcks, Keycloak and Microcks WebSocket hostnames:
+
+```sh
+  openssl req -x509 -nodes -days 365 \
+  -newkey rsa:2048 \
+  -keyout microcks-local.key \
+  -out microcks-local.crt \
+  -subj "/CN=microcks.127.0.0.1.nip.io" \
+  -addext "subjectAltName=DNS:microcks.127.0.0.1.nip.io,DNS:keycloak.127.0.0.1.nip.io,DNS:microcks-ws.127.0.0.1.nip.io"
+```
+
+Store it in a Kubernetes secret:
+
+```sh
+  kubectl create secret tls microcks-local-tls \
+  --namespace microcks \
+  --key=microcks-local.key \
+  --cert=microcks-local.crt
+```
+
+Check that the secret is created:
+
+```sh
+  kubectl get secret microcks-local-tls -n microcks
+```
+
+```sh
+
+NAME                 TYPE                DATA   AGE
+microcks-local-tls   kubernetes.io/tls   2      20s
+```
+
+Note that the certificate is self-signed, so the browser will display a security warning until you trust it.
+
+Configure an `EnvoyProxy` for the Kind cluster:
 
 ```sh
   cat <<EOF | kubectl apply -f -
@@ -196,7 +232,7 @@ spec:
 EOF
 ```
 
-Create two HTTPS listeners on port 443, one for Microcks and one for Keycloak. Both listeners use the same certificate, which covers both hostnames.
+Create a Gateway with three HTTPS listeners on port 443: one for Microcks, one for Keycloak and one for the Microcks WebSocket endpoint (used by the asynchronous features of step 6). All listeners use the same certificate, which covers the three hostnames.
 
 ```sh
   cat <<EOF | kubectl apply -f -
@@ -240,46 +276,25 @@ spec:
       allowedRoutes:
         namespaces:
           from: Same
+
+    - name: microcks-ws-https
+      hostname: microcks-ws.127.0.0.1.nip.io
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: microcks-local-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
 EOF
 ```
 
-## 4. Create a local TLS certificate
-
-Generates TLS certificates for Gateway API listeners:
-
-```sh
-  openssl req -x509 -nodes -days 365 \
-  -newkey rsa:2048 \
-  -keyout microcks-local.key \
-  -out microcks-local.crt \
-  -subj "/CN=microcks.127.0.0.1.nip.io" \
-  -addext "subjectAltName=DNS:microcks.127.0.0.1.nip.io,DNS:keycloak.127.0.0.1.nip.io"
-```
-
-```sh
-  kubectl create secret tls microcks-local-tls \
-  --namespace microcks \
-  --key=microcks-local.key \
-  --cert=microcks-local.crt
-```
-
-Check that the secret is created:
-
-```sh
-  kubectl get secret microcks-local-tls -n microcks
-```
-
-```sh
-
-NAME                 TYPE                DATA   AGE
-microcks-local-tls   kubernetes.io/tls   2      20s
-```
-
-Note that the certificate is self-signed, so the browser will display a security warning until you trust it.
-
 ## 5. Install Microcks 
 
-We're now going to install Microcks with basic options. We'll do that using the Helm Chart, so you'll also need the [`helm`](https://helm.sh) binary. You can use `brew install helm` on Mac for that.
+We're now going to install Microcks with basic options, using the Helm Chart.
 
 Add the Microcks Helm repository:
 
@@ -293,13 +308,11 @@ Install Microcks with Gateway API routes enabled and Ingress resources disabled:
 ```sh
   helm install microcks microcks/microcks \
   --namespace microcks \
-  --create-namespace \
   --set ingresses=false \
   --set gatewayRoutes=true \
   --set gatewayRefName=microcks-gateway \
   --set gatewayRefSectionName=microcks-https \
   --set microcks.url=microcks.127.0.0.1.nip.io \
-  --set microcks.gatewayRefSectionName=microcks-https \
   --set microcks.generateCert=false \
   --set keycloak.url=keycloak.127.0.0.1.nip.io \
   --set keycloak.privateUrl=http://microcks-keycloak.microcks.svc.cluster.local:8080 \
@@ -337,6 +350,8 @@ Keycloak has been deployed on https://keycloak.127.0.0.1.nip.io to protect user 
 You may want to configure an Identity Provider or add some users for your Microcks installation by login in using the
 username and password found into 'microcks-keycloak-admin' secret.
 ```
+
+> **Note:** The gRPC mock service is not exposed outside the cluster in this guide. The Helm chart still prints a message about the Ingress controller and creates a `GRPCRoute`, but no Gateway listener accepts this route, so you can ignore both. gRPC mocks are still reachable from inside the cluster on the `microcks-grpc` service, port 9090.
 
 Wait for the pods to become ready:
 
@@ -499,7 +514,7 @@ microcks-kafka-dual-role-0       ["broker-0.kafka.127.0.0.1.nip.io"]    1m
 microcks-kafka-kafka-bootstrap   ["bootstrap.kafka.127.0.0.1.nip.io"]   1m
 ```
 
-Now, upgrade the Microcks release to enable the asynchronous features. Microcks and its async minion connect to Kafka from inside the cluster, using the internal bootstrap service:
+Now, upgrade the Microcks release to enable the asynchronous features. Microcks and its async minion connect to Kafka from inside the cluster, using the internal bootstrap service. The WebSocket endpoint is attached to the `microcks-ws-https` listener created in step 4:
 
 ```sh
   helm upgrade microcks microcks/microcks \
@@ -507,7 +522,21 @@ Now, upgrade the Microcks release to enable the asynchronous features. Microcks 
   --reuse-values \
   --set features.async.enabled=true \
   --set features.async.kafka.install=false \
-  --set features.async.kafka.url=microcks-kafka-kafka-bootstrap:9092
+  --set features.async.kafka.url=microcks-kafka-kafka-bootstrap:9092 \
+  --set features.async.ws.gatewayRefSectionName=microcks-ws-https
+```
+
+Check that the WebSocket route has been created next to the Microcks and Keycloak ones:
+
+```sh
+  kubectl get httproute -n microcks
+```
+
+```sh
+NAME                HOSTNAMES                          AGE
+microcks            ["microcks.127.0.0.1.nip.io"]      12m
+microcks-keycloak   ["keycloak.127.0.0.1.nip.io"]      12m
+microcks-ws         ["microcks-ws.127.0.0.1.nip.io"]   30s
 ```
 
 Watch and check the pods you should get in the namespace:
@@ -611,7 +640,14 @@ Then uninstall Envoy Gateway:
 Release "envoy-gateway" uninstalled
 ```
 
-Finaly, you can delete the cluster if you want:
+Helm does not remove the CRDs installed by the Envoy Gateway chart. Delete the Gateway API and Envoy Gateway CRDs, then the namespaces:
+
+```sh
+  kubectl get crd -o name | grep -E 'gateway\.networking\.k8s\.io|gateway\.envoyproxy\.io' | xargs kubectl delete
+  kubectl delete namespace microcks envoy-gateway-system
+```
+
+Finally, you can delete the cluster if you want:
 
 ```sh
   kind delete cluster
