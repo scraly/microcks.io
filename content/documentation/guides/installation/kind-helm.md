@@ -137,7 +137,7 @@ Wait for the deployment to become ready:
 
 This installation also installs the Gateway API CRDs.
 
-Create a GatewayClass:
+Create a `GatewayClass`:
 
 ```sh
   cat <<EOF | kubectl apply -f -
@@ -154,7 +154,7 @@ EOF
 gatewayclass.gateway.networking.k8s.io/envoy created
 ```
 
-Verify that the GatewayClass has been accepted:
+Verify that the `GatewayClass` has been accepted:
 
 ```sh
   kubectl get gatewayclass envoy
