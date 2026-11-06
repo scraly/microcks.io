@@ -373,62 +373,141 @@ The default user/password is `admin/microcks123`
 
 ## 6. Install Microcks with asynchronous options
 
-This step is optional. It enables Microcks' asynchronous API mocking features and deploys a Kafka cluster managed by the Strimzi project.
+This step is optional. It enables Microcks' asynchronous API mocking features and deploys a Kafka cluster managed by the [Strimzi](https://strimzi.io) project.
 
-TODO!!!
+The Kafka cluster that the Microcks Helm chart can install for you is exposed through an `Ingress`. Since this guide uses Envoy Gateway instead of an Ingress controller, we deploy the Kafka cluster ourselves and expose it with Gateway API `TLSRoute` resources. This requires Strimzi 1.1.0 or later.
 
-In this section, we're installing Microcks completely and enabling the asynchronous protocols feature. This requires deploying additional pods and a Kafka cluster. Microcks installs and manages its own cluster using the [Strimzi](https://strimzi.io) project.
+Install the latest version of the Strimzi operator in the `microcks` namespace:
 
-To be able to expose the Kafka cluster to the outside of Kind, you’ll need to enable SSL passthrough on nginx: This requires updating the default ingress controller deployment:
-
-```sh
-  kubectl patch -n ingress-nginx deployment/ingress-nginx-controller --type='json' \
-    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-ssl-passthrough"}]'
-```
-
-Then, you have to install the latest version of Strimzi, which provides an easy way to set up Kafka on Kubernetes:
 ```sh
   kubectl apply -f 'https://strimzi.io/install/latest?namespace=microcks' -n microcks
 ```
 
-Now, you can install Microcks using the Helm chart and enable the asynchronous features:
+Wait for the operator to become ready:
 
 ```sh
-  helm install microcks microcks/microcks --namespace microcks --set microcks.url=microcks.127.0.0.1.nip.io --set keycloak.url=keycloak.127.0.0.1.nip.io --set keycloak.privateUrl=http://microcks-keycloak.microcks.svc.cluster.local:8080 --set features.async.enabled=true --set features.async.kafka.url=kafka.127.0.0.1.nip.io
+  kubectl wait \
+  --namespace microcks \
+  --for=condition=Available \
+  deployment/strimzi-cluster-operator \
+  --timeout=300s
 ```
+
+Kafka clients use TLS and Server Name Indication (SNI) to reach the bootstrap server and each broker. Add a TLS passthrough listener for the Kafka hostnames to the Gateway, so Envoy forwards the encrypted traffic directly to the brokers:
+
 ```sh
+  kubectl patch gateway microcks-gateway -n microcks --type=json -p '[
+    {
+      "op": "add",
+      "path": "/spec/listeners/-",
+      "value": {
+        "name": "kafka-tls",
+        "hostname": "*.kafka.127.0.0.1.nip.io",
+        "port": 443,
+        "protocol": "TLS",
+        "tls": { "mode": "Passthrough" },
+        "allowedRoutes": { "namespaces": { "from": "Same" } }
+      }
+    }
+  ]'
+```
 
-NAME: microcks
-LAST DEPLOYED: Sun Dec  3 20:14:38 2023
-NAMESPACE: microcks
-STATUS: deployed
-REVISION: 1
-TEST SUITE: None
-NOTES:
-Thank you for installing microcks.
+```sh
+gateway.gateway.networking.k8s.io/microcks-gateway patched
+```
 
-Your release is named microcks.
+Create a single-node Kafka cluster with an external `tlsroute` listener attached to this Gateway listener, and the topic Microcks uses to share service updates:
 
-To learn more about the release, try:
+```sh
+  cat <<EOF | kubectl apply -n microcks -f -
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: dual-role
+  labels:
+    strimzi.io/cluster: microcks-kafka
+spec:
+  replicas: 1
+  roles:
+    - controller
+    - broker
+  storage:
+    type: ephemeral
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: microcks-kafka
+spec:
+  kafka:
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: external
+        port: 9094
+        type: tlsroute
+        tls: true
+        configuration:
+          parentRefs:
+            - name: microcks-gateway
+              kind: Gateway
+              group: gateway.networking.k8s.io
+              namespace: microcks
+              sectionName: kafka-tls
+          bootstrap:
+            host: bootstrap.kafka.127.0.0.1.nip.io
+          hostTemplate: broker-{nodeId}.kafka.127.0.0.1.nip.io
+    config:
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: microcks-services-updates
+  labels:
+    strimzi.io/cluster: microcks-kafka
+spec:
+  partitions: 1
+  replicas: 1
+EOF
+```
 
-    helm status microcks
-    helm get microcks
+Wait for the Kafka cluster to become ready (pulling the images may take a few minutes):
 
-Microcks is available at https://microcks.127.0.0.1.nip.io.
+```sh
+  kubectl wait kafka/microcks-kafka -n microcks --for=condition=Ready --timeout=600s
+```
 
-GRPC mock service is available at "microcks-grpc.127.0.0.1.nip.io".
-It has been exposed using TLS passthrough on the Ingress controller, you should extract the certificate for your client using:
+Check that Strimzi created the TLS routes for the bootstrap server and the broker:
 
-    kubectl get secret microcks-microcks-grpc-secret -n microcks -o jsonpath='{.data.tls\.crt}' | base64 -d > tls.crt
+```sh
+  kubectl get tlsroute -n microcks
+```
 
-Keycloak has been deployed on https://keycloak.127.0.0.1.nip.io to protect user access.
-You may want to configure an Identity Provider or add some users for your Microcks installation by login in using the
-username and password found into 'microcks-keycloak-admin' secret.
+```sh
+NAME                             HOSTNAMES                              AGE
+microcks-kafka-dual-role-0       ["broker-0.kafka.127.0.0.1.nip.io"]    1m
+microcks-kafka-kafka-bootstrap   ["bootstrap.kafka.127.0.0.1.nip.io"]   1m
+```
 
-Kafka broker has been deployed on microcks-kafka.kafka.127.0.0.1.nip.io.
-It has been exposed using TLS passthrough on the Ingress controller, you should extract the certificate for your client using:
+Now, upgrade the Microcks release to enable the asynchronous features. Microcks and its async minion connect to Kafka from inside the cluster, using the internal bootstrap service:
 
-    kubectl get secret microcks-kafka-cluster-ca-cert -n microcks -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
+```sh
+  helm upgrade microcks microcks/microcks \
+  --namespace microcks \
+  --reuse-values \
+  --set features.async.enabled=true \
+  --set features.async.kafka.install=false \
+  --set features.async.kafka.url=microcks-kafka-kafka-bootstrap:9092
 ```
 
 Watch and check the pods you should get in the namespace:
@@ -436,30 +515,23 @@ Watch and check the pods you should get in the namespace:
 ```sh
   kubectl get pods -n microcks
 ```
-```sh
 
-NAME                                              READY   STATUS    RESTARTS        AGE
-microcks-6ffcc7dc54-c9h4w                         1/1     Running   0               68s
-microcks-async-minion-7f689d9ff7-ptv4c            1/1     Running   2 (40s ago)     48s
-microcks-kafka-entity-operator-585dc4cd45-24tvp   3/3     Running   0               2m19s
-microcks-kafka-kafka-0                            1/1     Running   0               2m41s
-microcks-kafka-zookeeper-0                        1/1     Running   5 (4m56s ago)   6m43s
-microcks-keycloak-77447d8957-fwhv6                1/1     Running   0               87s
-microcks-keycloak-postgresql-868b7dbdd4-pb52g     1/1     Running   0               2m43s
-microcks-mongodb-78888fb67f-7t2vf                 1/1     Running   4 (3m57s ago)   8m2s
-microcks-postman-runtime-857c577dfb-d597r         1/1     Running   0               8m2s
-strimzi-cluster-operator-95d88f6b5-p8bvs          1/1     Running   0               16m
+You should see the `microcks-async-minion`, `microcks-kafka-dual-role-0`, `microcks-kafka-entity-operator` and `strimzi-cluster-operator` pods running, in addition to the pods from the basic installation. The async minion may restart a few times while Kafka is starting.
+
+Extract the Kafka cluster CA certificate, which external clients need to trust the brokers:
+
+```sh
+  kubectl get secret microcks-kafka-cluster-ca-cert -n microcks -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
 ```
 
-Now you can extract the Kafka cluster certificate using `kubectl get secret microcks-kafka-cluster-ca-cert -n microcks -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt` and apply the checks found at [Async Features with Docker Compose](https://microcks.io/blog/async-features-with-docker-compose/)
+You can now apply the checks found at [Async Features with Docker Compose](https://microcks.io/blog/async-features-with-docker-compose/).
 
 Start with loading the [User signed-up API](https://microcks.io/blog/async-features-with-docker-compose/#load-a-sample-and-check-up) sample within your Microcks instance - remember that you have to validate the self-signed certificates like in the basic install first.
 
 Now connect to the Kafka broker pod to check that a topic has been correctly created and that you can consume messages from there:
 
-
 ```sh
-  kubectl -n microcks exec microcks-kafka-kafka-0 -it -- /bin/sh
+  kubectl -n microcks exec microcks-kafka-dual-role-0 -it -- /bin/sh
 ```
 ```sh
 --- INPUT ---
@@ -480,10 +552,10 @@ exit
 command terminated with exit code 130
 ```
 
-And finally, from your Mac host, you can install the [`kcat`](https://github.com/edenhill/kcat) utility to consume messages as well. You'll need to refer to the `ca.crt` certificate you previously extracted from there:
+And finally, from your Mac host, you can install the [`kcat`](https://github.com/edenhill/kcat) utility to consume messages through the Gateway as well. You'll need to refer to the `ca.crt` certificate you previously extracted:
 
 ```sh
-  kcat -b microcks-kafka.kafka.127.0.0.1.nip.io:443 -X security.protocol=SSL -X ssl.ca.location=ca.crt -t UsersignedupAPI-0.1.1-user-signedup
+  kcat -b bootstrap.kafka.127.0.0.1.nip.io:443 -X security.protocol=SSL -X ssl.ca.location=ca.crt -t UsersignedupAPI-0.1.1-user-signedup
 ```
 ```sh
 
@@ -510,6 +582,13 @@ Delete Microcks first:
 ```sh
 
 Release "microcks" uninstalled
+```
+
+If you followed step 6, delete the Kafka cluster and the Strimzi operator:
+
+```sh
+  kubectl delete kafkatopic,kafka,kafkanodepool --all -n microcks
+  kubectl delete -f 'https://strimzi.io/install/latest?namespace=microcks' -n microcks
 ```
 
 Delete the Gateway and its supporting resources:
