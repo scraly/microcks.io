@@ -3,7 +3,7 @@ draft: false
 title: "On Kind with Helm"
 date: 2024-04-30
 publishdate: 2024-04-30
-lastmod: 2024-06-13
+lastmod: 2026-11-06
 weight: 4
 ---
 
@@ -39,10 +39,6 @@ apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
     extraPortMappings:
-      - containerPort: 30080
-        hostPort: 80
-        listenAddress: "127.0.0.1"
-        protocol: TCP
       - containerPort: 30443
         hostPort: 443
         listenAddress: "127.0.0.1"
