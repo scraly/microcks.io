@@ -9,9 +9,9 @@ weight: 4
 
 ## Overview 
 
-This guide will walk you through the different steps of running a full Microcks installation on your laptop using [Kind](https://kind.sigs.k8s.io). Step #4 is actually optional and may only be of interest if you'd like to use the Asynchronous features of Microcks.
+This guide will walk you through the different steps of running a full Microcks installation on your laptop using [Kind](https://kind.sigs.k8s.io). Step #6 is actually optional and may only be of interest if you'd like to use the Asynchronous features of Microcks.
 
-The installation notes were run on an Apple MacBook M2, but those steps would sensibly be the same on any Linux machine. 
+The installation notes were run on an Apple MacBook M1, but those steps would sensibly be the same on any Linux machine. 
 
 Let's go 🚀
 
@@ -373,6 +373,8 @@ The default user/password is `admin/microcks123`
 
 ## 6. Install Microcks with asynchronous options
 
+This step is optional. It enables Microcks' asynchronous API mocking features and deploys a Kafka cluster managed by the Strimzi project.
+
 TODO!!!
 
 In this section, we're installing Microcks completely and enabling the asynchronous protocols feature. This requires deploying additional pods and a Kafka cluster. Microcks installs and manages its own cluster using the [Strimzi](https://strimzi.io) project.
@@ -495,9 +497,11 @@ And finally, from your Mac host, you can install the [`kcat`](https://github.com
 ^C%  
 ```
 
-## 6. Delete everything and stop the cluster
+## 7. Delete everything and stop the cluster
 
-Deleting the microcks Helm release from your cluster is straightforward. Then you can finally delete the envoy gateway and your Kind cluster to save some resources!
+To remove the Microcks installation, delete the Helm releases and the Kubernetes resources created for Envoy Gateway.
+
+Delete Microcks first:
 
 ```sh
   helm delete microcks -n microcks
@@ -508,8 +512,19 @@ Deleting the microcks Helm release from your cluster is straightforward. Then yo
 Release "microcks" uninstalled
 ```
 
+Delete the Gateway and its supporting resources:
+
 ```sh
-  helm delete envoy-gateway -n envoy-gateway-system
+  kubectl delete gateway microcks-gateway -n microcks
+  kubectl delete envoyproxy microcks-proxy -n microcks
+  kubectl delete secret microcks-local-tls -n microcks
+  kubectl delete gatewayclass envoy
+```
+
+Then uninstall Envoy Gateway:
+
+```sh
+  helm uninstall envoy-gateway -n envoy-gateway-system
 ```
 
 ```sh
@@ -517,6 +532,7 @@ Release "microcks" uninstalled
 Release "envoy-gateway" uninstalled
 ```
 
+Finaly, you can delete the cluster if you want:
 
 ```sh
   kind delete cluster
